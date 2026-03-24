@@ -1,0 +1,58 @@
+
+########## Build outputs (ALL modules) ##########
+build/
+*/build/
+*/bin/
+server/bin/
+client/bin/
+protocol/bin/
+
+########## Compiled Java ##########
+*.class
+
+########## Logs ##########
+*.log
+logs/
+server/logs/
+jmeter.log
+jmeter/*.log
+
+########## Gradle ##########
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+########## IntelliJ IDEA ##########
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+########## OS files ##########
+.DS_Store
+Thumbs.db
+
+########## Distribution archives ##########
+*.zip
+*.tar
+
+########## Generated files ##########
+*/generated/
+*/tmp/
+
+########## Test reports ##########
+*/reports/
+*/test-results/
+
+########## JMeter temp outputs ##########
+jmeter/*.jtl
+
+########## Environment / local configs ##########
+.env
+*.local
+
+########## Optional: ignore config overrides ##########
+
+# Uncomment if you add local overrides
+
+# application-local.conf

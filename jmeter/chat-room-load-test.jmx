@@ -1,0 +1,924 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Chat Room Load Test">
+      <stringProp name="TestPlan.comments">Load test plan for TCP chat room server with custom binary protocol (4-byte length prefix + JSON)</stringProp>
+      <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="SERVER_HOST" elementType="Argument">
+            <stringProp name="Argument.name">SERVER_HOST</stringProp>
+            <stringProp name="Argument.value">localhost</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="SERVER_PORT" elementType="Argument">
+            <stringProp name="Argument.name">SERVER_PORT</stringProp>
+            <stringProp name="Argument.value">9090</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="HEALTH_PORT" elementType="Argument">
+            <stringProp name="Argument.name">HEALTH_PORT</stringProp>
+            <stringProp name="Argument.value">8081</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="TEST_ROOM" elementType="Argument">
+            <stringProp name="Argument.name">TEST_ROOM</stringProp>
+            <stringProp name="Argument.value">loadtest-room</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+    </TestPlan>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="TCP Chat Flow">
+        <intProp name="ThreadGroup.num_threads">10</intProp>
+        <intProp name="ThreadGroup.ramp_time">5</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">false</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="Test Users CSV" enabled="true">
+          <stringProp name="delimiter">,</stringProp>
+          <stringProp name="fileEncoding">UTF-8</stringProp>
+          <stringProp name="filename">jmeter/test-users.csv</stringProp>
+          <boolProp name="ignoreFirstLine">true</boolProp>
+          <boolProp name="quotedData">false</boolProp>
+          <boolProp name="recycle">true</boolProp>
+          <stringProp name="shareMode">shareMode.all</stringProp>
+          <boolProp name="stopThread">false</boolProp>
+          <stringProp name="variableNames">username,password</stringProp>
+        </CSVDataSet>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="01 - Connect &amp; Authenticate" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def host = vars.get(&quot;SERVER_HOST&quot;)
+def port = vars.get(&quot;SERVER_PORT&quot;) as int
+def username = vars.get(&quot;username&quot;)
+def password = vars.get(&quot;password&quot;)
+
+// Helper: encode a JSON string as a length-prefixed frame
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+// Helper: read a length-prefixed frame and return the JSON string
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed while reading header&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    if (length &lt;= 0 || length &gt; 65536) throw new IOException(&quot;Invalid frame length: &quot; + length)
+
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed while reading payload&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    // Open TCP connection
+    Socket socket = new Socket(host, port)
+    socket.setSoTimeout(10000)  // 10s read timeout
+    socket.setTcpNoDelay(true)
+
+    def out = socket.getOutputStream()
+    def inStream = socket.getInputStream()
+
+    // Store socket for later samplers
+    vars.putObject(&quot;tcp_socket&quot;, socket)
+    vars.putObject(&quot;tcp_out&quot;, out)
+    vars.putObject(&quot;tcp_in&quot;, inStream)
+
+    // Build AUTH_REQUEST JSON
+    long ts = System.currentTimeMillis()
+    String authJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;AUTH_REQUEST&quot;,&quot;sender&quot;:&quot;${username}&quot;,&quot;content&quot;:&quot;${password}&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    // Send AUTH_REQUEST
+    out.write(encodeFrame(authJson))
+    out.flush()
+
+    // Read AUTH_RESPONSE
+    String response = readFrame(inStream)
+    vars.put(&quot;auth_response&quot;, response)
+
+    // Check success
+    if (response.contains(&apos;&quot;success&quot;:true&apos;)) {
+        // Extract sessionId
+        def matcher = (response =~ /&quot;sessionId&quot;:&quot;([^&quot;]+)&quot;/)
+        if (matcher.find()) {
+            vars.put(&quot;sessionId&quot;, matcher.group(1))
+        }
+        SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;AUTH_SUCCESS&quot;)
+        SampleResult.setSuccessful(true)
+    } else {
+        SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+        SampleResult.setResponseCode(&quot;401&quot;)
+        SampleResult.setResponseMessage(&quot;AUTH_FAILED&quot;)
+        SampleResult.setSuccessful(false)
+    }
+
+    // Read the auto-join SYSTEM message for default room (if any)
+    try {
+        socket.setSoTimeout(2000)
+        String systemMsg = readFrame(inStream)
+        vars.put(&quot;system_join_msg&quot;, systemMsg)
+        // There might also be a HISTORY_RESPONSE, try to read it
+        try {
+            String historyMsg = readFrame(inStream)
+            vars.put(&quot;auto_history&quot;, historyMsg)
+        } catch (Exception ignore) {}
+    } catch (Exception ignore) {}
+
+    socket.setSoTimeout(10000)  // Reset timeout
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;Connection failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+    log.error(&quot;Auth failed for &quot; + username, e)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Assert Auth Success" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="-538673239">success&quot;:true</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">Authentication should succeed</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">2</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">500</stringProp>
+          <stringProp name="RandomTimer.range">1000</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="02 - Send Chat Message (general)" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def inStream = vars.getObject(&quot;tcp_in&quot;)
+    def username = vars.get(&quot;username&quot;)
+
+    long ts = System.currentTimeMillis()
+    int msgNum = (int)(Math.random() * 10000)
+    String chatJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;CHAT&quot;,&quot;room&quot;:&quot;general&quot;,&quot;sender&quot;:&quot;${username}&quot;,&quot;content&quot;:&quot;Load test message #${msgNum} from ${username}&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(chatJson))
+    out.flush()
+
+    // Read the broadcast echo back
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+    socket.setSoTimeout(5000)
+    String response = readFrame(inStream)
+    socket.setSoTimeout(10000)
+
+    SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+    if (response.contains(&apos;&quot;type&quot;:&quot;CHAT&quot;&apos;)) {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;CHAT_SENT&quot;)
+        SampleResult.setSuccessful(true)
+    } else {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;RESPONSE_RECEIVED&quot;)
+        SampleResult.setSuccessful(true)
+    }
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;Chat failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+    log.error(&quot;Chat send failed&quot;, e)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">300</stringProp>
+          <stringProp name="RandomTimer.range">700</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="03 - Join Room" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def inStream = vars.getObject(&quot;tcp_in&quot;)
+    def testRoom = vars.get(&quot;TEST_ROOM&quot;)
+
+    long ts = System.currentTimeMillis()
+    String joinJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;JOIN&quot;,&quot;room&quot;:&quot;${testRoom}&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(joinJson))
+    out.flush()
+
+    // Read the SYSTEM acknowledgement
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+    socket.setSoTimeout(5000)
+    String response = readFrame(inStream)
+    socket.setSoTimeout(10000)
+
+    SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+    if (response.contains(&apos;&quot;type&quot;:&quot;SYSTEM&quot;&apos;) || response.contains(&quot;joined&quot;)) {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;JOIN_SUCCESS&quot;)
+        SampleResult.setSuccessful(true)
+    } else {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;JOIN_RESPONSE&quot;)
+        SampleResult.setSuccessful(true)
+    }
+
+    // There might be a HISTORY_RESPONSE too, try to drain it
+    try {
+        socket.setSoTimeout(1000)
+        String histMsg = readFrame(inStream)
+        vars.put(&quot;join_history&quot;, histMsg)
+    } catch (Exception ignore) {}
+    socket.setSoTimeout(10000)
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;Join failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+    log.error(&quot;Join room failed&quot;, e)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">300</stringProp>
+          <stringProp name="RandomTimer.range">700</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="04 - Send Chat (test room)" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def inStream = vars.getObject(&quot;tcp_in&quot;)
+    def username = vars.get(&quot;username&quot;)
+    def testRoom = vars.get(&quot;TEST_ROOM&quot;)
+
+    long ts = System.currentTimeMillis()
+    String chatJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;CHAT&quot;,&quot;room&quot;:&quot;${testRoom}&quot;,&quot;sender&quot;:&quot;${username}&quot;,&quot;content&quot;:&quot;Test room message from ${username} at ${ts}&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(chatJson))
+    out.flush()
+
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+    socket.setSoTimeout(5000)
+    String response = readFrame(inStream)
+    socket.setSoTimeout(10000)
+
+    SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;200&quot;)
+    SampleResult.setResponseMessage(&quot;CHAT_SENT&quot;)
+    SampleResult.setSuccessful(true)
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;Chat in test room failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">300</stringProp>
+          <stringProp name="RandomTimer.range">700</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="05 - List Rooms" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def inStream = vars.getObject(&quot;tcp_in&quot;)
+
+    long ts = System.currentTimeMillis()
+    String listJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;LIST_ROOMS&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(listJson))
+    out.flush()
+
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+    socket.setSoTimeout(5000)
+    String response = readFrame(inStream)
+    socket.setSoTimeout(10000)
+
+    SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+    if (response.contains(&apos;&quot;type&quot;:&quot;LIST_ROOMS_RESPONSE&quot;&apos;)) {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;LIST_ROOMS_OK&quot;)
+        SampleResult.setSuccessful(true)
+    } else {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;RESPONSE_RECEIVED&quot;)
+        SampleResult.setSuccessful(true)
+    }
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;List rooms failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Assert List Rooms Response" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="254933897">LIST_ROOMS_RESPONSE</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">Should receive LIST_ROOMS_RESPONSE</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">2</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">300</stringProp>
+          <stringProp name="RandomTimer.range">700</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="06 - Request History" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def inStream = vars.getObject(&quot;tcp_in&quot;)
+
+    long ts = System.currentTimeMillis()
+    String histJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;HISTORY_REQUEST&quot;,&quot;room&quot;:&quot;general&quot;,&quot;timestamp&quot;:${ts},&quot;metadata&quot;:{&quot;count&quot;:&quot;20&quot;}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(histJson))
+    out.flush()
+
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+    socket.setSoTimeout(5000)
+    String response = readFrame(inStream)
+    socket.setSoTimeout(10000)
+
+    SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+    if (response.contains(&apos;&quot;type&quot;:&quot;HISTORY_RESPONSE&quot;&apos;)) {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;HISTORY_OK&quot;)
+        SampleResult.setSuccessful(true)
+    } else {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;RESPONSE_RECEIVED&quot;)
+        SampleResult.setSuccessful(true)
+    }
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;History request failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Assert History Response" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="-1394866260">HISTORY_RESPONSE</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">Should receive HISTORY_RESPONSE</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">2</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">300</stringProp>
+          <stringProp name="RandomTimer.range">700</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="07 - Leave Room" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+def readFrame(InputStream inputStream) {
+    byte[] header = new byte[4]
+    int totalRead = 0
+    while (totalRead &lt; 4) {
+        int n = inputStream.read(header, totalRead, 4 - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    int length = ByteBuffer.wrap(header).getInt()
+    byte[] payload = new byte[length]
+    totalRead = 0
+    while (totalRead &lt; length) {
+        int n = inputStream.read(payload, totalRead, length - totalRead)
+        if (n == -1) throw new IOException(&quot;Connection closed&quot;)
+        totalRead += n
+    }
+    return new String(payload, StandardCharsets.UTF_8)
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def inStream = vars.getObject(&quot;tcp_in&quot;)
+    def testRoom = vars.get(&quot;TEST_ROOM&quot;)
+
+    long ts = System.currentTimeMillis()
+    String leaveJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;LEAVE&quot;,&quot;room&quot;:&quot;${testRoom}&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(leaveJson))
+    out.flush()
+
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+    socket.setSoTimeout(5000)
+    String response = readFrame(inStream)
+    socket.setSoTimeout(10000)
+
+    SampleResult.setResponseData(response, &quot;UTF-8&quot;)
+    if (response.contains(&quot;left&quot;) || response.contains(&apos;&quot;type&quot;:&quot;SYSTEM&quot;&apos;)) {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;LEAVE_OK&quot;)
+        SampleResult.setSuccessful(true)
+    } else {
+        SampleResult.setResponseCode(&quot;200&quot;)
+        SampleResult.setResponseMessage(&quot;RESPONSE_RECEIVED&quot;)
+        SampleResult.setSuccessful(true)
+    }
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;Leave failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">200</stringProp>
+          <stringProp name="RandomTimer.range">500</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="08 - Disconnect" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+def encodeFrame(String json) {
+    byte[] payload = json.getBytes(StandardCharsets.UTF_8)
+    ByteBuffer buf = ByteBuffer.allocate(4 + payload.length)
+    buf.putInt(payload.length)
+    buf.put(payload)
+    return buf.array()
+}
+
+try {
+    def out = vars.getObject(&quot;tcp_out&quot;)
+    def socket = vars.getObject(&quot;tcp_socket&quot;)
+
+    long ts = System.currentTimeMillis()
+    String disconnectJson = &quot;&quot;&quot;{&quot;type&quot;:&quot;DISCONNECT&quot;,&quot;content&quot;:&quot;Load test complete&quot;,&quot;timestamp&quot;:${ts}}&quot;&quot;&quot;
+
+    out.write(encodeFrame(disconnectJson))
+    out.flush()
+
+    // Close the socket
+    Thread.sleep(200)
+    socket.close()
+
+    vars.putObject(&quot;tcp_socket&quot;, null)
+    vars.putObject(&quot;tcp_out&quot;, null)
+    vars.putObject(&quot;tcp_in&quot;, null)
+
+    SampleResult.setResponseData(&quot;Disconnected gracefully&quot;, &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;200&quot;)
+    SampleResult.setResponseMessage(&quot;DISCONNECTED&quot;)
+    SampleResult.setSuccessful(true)
+
+} catch (Exception e) {
+    SampleResult.setResponseData(&quot;Disconnect failed: &quot; + e.getMessage(), &quot;UTF-8&quot;)
+    SampleResult.setResponseCode(&quot;500&quot;)
+    SampleResult.setResponseMessage(&quot;ERROR&quot;)
+    SampleResult.setSuccessful(false)
+}
+</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Health Endpoint Check">
+        <intProp name="ThreadGroup.num_threads">5</intProp>
+        <intProp name="ThreadGroup.ramp_time">2</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller">
+          <stringProp name="LoopController.loops">5</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /health" enabled="true">
+          <intProp name="HTTPSampler.connect_timeout">5000</intProp>
+          <intProp name="HTTPSampler.response_timeout">10000</intProp>
+          <stringProp name="HTTPSampler.domain">${SERVER_HOST}</stringProp>
+          <stringProp name="HTTPSampler.port">${HEALTH_PORT}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.path">/health</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Assert Status 200" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">Health endpoint should return 200</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Assert Health UP" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="2715">UP</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">Health status should be UP</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">2</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Think Time" enabled="true">
+          <stringProp name="ConstantTimer.delay">500</stringProp>
+          <stringProp name="RandomTimer.range">500</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /metrics" enabled="true">
+          <intProp name="HTTPSampler.connect_timeout">5000</intProp>
+          <intProp name="HTTPSampler.response_timeout">10000</intProp>
+          <stringProp name="HTTPSampler.domain">${SERVER_HOST}</stringProp>
+          <stringProp name="HTTPSampler.port">${HEALTH_PORT}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.path">/metrics</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Assert Status 200" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">Metrics endpoint should return 200</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+      <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="Summary Report">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+            <dataType>true</dataType>
+            <encoding>false</encoding>
+            <assertions>true</assertions>
+            <subresults>true</subresults>
+            <responseData>false</responseData>
+            <samplerData>false</samplerData>
+            <xml>false</xml>
+            <fieldNames>true</fieldNames>
+            <responseHeaders>false</responseHeaders>
+            <requestHeaders>false</requestHeaders>
+            <responseDataOnError>false</responseDataOnError>
+            <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+            <assertionsResultsToSave>0</assertionsResultsToSave>
+            <bytes>true</bytes>
+            <sentBytes>true</sentBytes>
+            <url>true</url>
+            <threadCounts>true</threadCounts>
+            <sampleCount>true</sampleCount>
+            <idleTime>true</idleTime>
+            <connectTime>true</connectTime>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+      <ResultCollector guiclass="StatVisualizer" testclass="ResultCollector" testname="Aggregate Report">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+            <dataType>true</dataType>
+            <encoding>false</encoding>
+            <assertions>true</assertions>
+            <subresults>true</subresults>
+            <responseData>false</responseData>
+            <samplerData>false</samplerData>
+            <xml>false</xml>
+            <fieldNames>true</fieldNames>
+            <responseHeaders>false</responseHeaders>
+            <requestHeaders>false</requestHeaders>
+            <responseDataOnError>false</responseDataOnError>
+            <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+            <assertionsResultsToSave>0</assertionsResultsToSave>
+            <bytes>true</bytes>
+            <sentBytes>true</sentBytes>
+            <url>true</url>
+            <threadCounts>true</threadCounts>
+            <sampleCount>true</sampleCount>
+            <idleTime>true</idleTime>
+            <connectTime>true</connectTime>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+      <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="View Results Tree (Debug)" enabled="false">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+            <dataType>true</dataType>
+            <encoding>false</encoding>
+            <assertions>true</assertions>
+            <subresults>true</subresults>
+            <responseData>true</responseData>
+            <samplerData>true</samplerData>
+            <xml>false</xml>
+            <fieldNames>true</fieldNames>
+            <responseHeaders>false</responseHeaders>
+            <requestHeaders>false</requestHeaders>
+            <responseDataOnError>true</responseDataOnError>
+            <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+            <assertionsResultsToSave>0</assertionsResultsToSave>
+            <bytes>true</bytes>
+            <sentBytes>true</sentBytes>
+            <url>true</url>
+            <threadCounts>true</threadCounts>
+            <sampleCount>true</sampleCount>
+            <idleTime>true</idleTime>
+            <connectTime>true</connectTime>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
